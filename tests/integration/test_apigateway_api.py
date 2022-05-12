@@ -7,11 +7,16 @@ from moto.core import ACCOUNT_ID
 
 from localstack.services.apigateway.helpers import path_based_url
 from localstack.utils.strings import short_uid
+from tests.integration.util import write_snapshot_samples
 
 
 def test_create_and_get_rest_api(apigateway_client):
     response = apigateway_client.create_rest_api(name="my_api", description="this is my api")
     api_id = response["id"]
+
+    write_snapshot_samples(
+        lambda: apigateway_client.get_rest_api(restApiId=api_id), "api_gateway", "get_rest_api"
+    )
 
     response = apigateway_client.get_rest_api(restApiId=api_id)
 
