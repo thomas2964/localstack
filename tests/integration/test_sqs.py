@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from threading import Timer
 from urllib.parse import urlencode
 
 import pytest
@@ -58,6 +59,32 @@ def queue_exists(sqs_client, queue_url: str) -> bool:
         if "NonExistentQueue" in e.response["Error"]["Code"]:
             return False
         raise
+
+
+def get_queue_arn(sqs_client, queue_url: str) -> str:
+    """
+    Returns the given Queue's ARN. Expects the Queue to exist.
+
+    :param sqs_client: the boto3 client
+    :param queue_url: the queue URL
+    :return: the QueueARN
+    """
+    response = sqs_client.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])
+    return response["Attributes"]["QueueArn"]
+
+
+def get_qsize(sqs_client, queue_url: str) -> int:
+    """
+    Returns the integer value of the ApproximateNumberOfMessages queue attribute.
+
+    :param sqs_client: the boto3 client
+    :param queue_url: the queue URL
+    :return: the ApproximateNumberOfMessages converted to int
+    """
+    response = sqs_client.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["ApproximateNumberOfMessages"]
+    )
+    return int(response["Attributes"]["ApproximateNumberOfMessages"])
 
 
 class TestSqsProvider:
@@ -303,6 +330,61 @@ class TestSqsProvider:
         queue_url = sqs_create_queue(QueueName=queue_name, Attributes=attributes)
 
         assert sqs_create_queue(QueueName=queue_name, Attributes=attributes) == queue_url
+
+    @pytest.mark.aws_validated
+    def test_receive_message_wait_time_seconds_and_max_number_of_messages_does_not_block(
+        self, sqs_client, sqs_queue
+    ):
+        """
+        this test makes sure that `WaitTimeSeconds` does not block when messages are in the queue, even when
+        `MaxNumberOfMessages` is provided.
+        """
+        sqs_client.send_message(QueueUrl=sqs_queue, MessageBody="foobar1")
+        sqs_client.send_message(QueueUrl=sqs_queue, MessageBody="foobar2")
+
+        # wait for the two messages to be in the queue
+        assert poll_condition(lambda: get_qsize(sqs_client, sqs_queue) == 2)
+
+        then = time.time()
+        response = sqs_client.receive_message(
+            QueueUrl=sqs_queue, MaxNumberOfMessages=3, WaitTimeSeconds=5
+        )
+        took = time.time() - then
+        assert took < 2  # should take much less than 5 seconds
+
+        assert (
+            len(response.get("Messages", [])) >= 1
+        ), f"unexpected number of messages in {response}"
+
+    @pytest.mark.aws_validated
+    def test_wait_time_seconds_waits_correctly(self, sqs_client, sqs_queue):
+        def _send_message():
+            sqs_client.send_message(QueueUrl=sqs_queue, MessageBody="foobared")
+
+        Timer(1, _send_message).start()  # send message asynchronously after 1 second
+        response = sqs_client.receive_message(QueueUrl=sqs_queue, WaitTimeSeconds=10)
+
+        assert (
+            len(response.get("Messages", [])) == 1
+        ), f"unexpected number of messages in response {response}"
+
+    @pytest.mark.aws_validated
+    def test_wait_time_seconds_queue_attribute_waits_correctly(self, sqs_client, sqs_create_queue):
+        queue_url = sqs_create_queue(
+            Attributes={
+                "ReceiveMessageWaitTimeSeconds": "10",
+            }
+        )
+
+        def _send_message():
+            sqs_client.send_message(QueueUrl=queue_url, MessageBody="foobared")
+
+        Timer(1, _send_message).start()  # send message asynchronously after 1 second
+        response = sqs_client.receive_message(QueueUrl=queue_url)
+
+        assert (
+            len(response.get("Messages", [])) == 1
+        ), f"unexpected number of messages in response {response}"
 
     @pytest.mark.aws_validated
     @pytest.mark.xfail(reason="see https://github.com/localstack/localstack/issues/5938")
@@ -731,13 +813,7 @@ class TestSqsProvider:
         result_recv = sqs_client.receive_message(QueueUrl=queue_url)
         assert result_recv["Messages"][0]["MessageId"] == message_id
 
-    def test_fifo_queue_without_fifo_queue_attribute(self, sqs_create_queue):
-        queue_name = f"invalid-{short_uid()}.fifo"
-
-        with pytest.raises(Exception) as e:
-            sqs_create_queue(QueueName=queue_name)
-        e.match("InvalidParameterValue")
-
+    @pytest.mark.aws_validated
     def test_fifo_queue_requires_suffix(self, sqs_create_queue):
         queue_name = f"invalid-{short_uid()}"
         attributes = {"FifoQueue": "true"}
@@ -746,6 +822,7 @@ class TestSqsProvider:
             sqs_create_queue(QueueName=queue_name, Attributes=attributes)
         e.match("InvalidParameterValue")
 
+    @pytest.mark.aws_validated
     def test_standard_queue_cannot_have_fifo_suffix(self, sqs_create_queue):
         queue_name = f"queue-{short_uid()}.fifo"
         with pytest.raises(Exception) as e:
@@ -756,9 +833,7 @@ class TestSqsProvider:
     def test_redrive_policy_attribute_validity(self, sqs_create_queue, sqs_client):
         dl_queue_name = f"dl-queue-{short_uid()}"
         dl_queue_url = sqs_create_queue(QueueName=dl_queue_name)
-        dl_target_arn = sqs_client.get_queue_attributes(
-            QueueUrl=dl_queue_url, AttributeNames=["QueueArn"]
-        )["Attributes"]["QueueArn"]
+        dl_target_arn = get_queue_arn(sqs_client, dl_queue_url)
         queue_name = f"queue-{short_uid()}"
         queue_url = sqs_create_queue(QueueName=queue_name)
         valid_max_receive_count = "42"
@@ -903,7 +978,22 @@ class TestSqsProvider:
         )
         assert receive_result["Messages"][0]["MessageAttributes"] == attributes
 
-    @pytest.mark.xfail
+    @pytest.mark.aws_validated
+    def test_send_message_with_empty_string_attribute(self, sqs_client, sqs_queue):
+        with pytest.raises(ClientError) as e:
+            sqs_client.send_message(
+                QueueUrl=sqs_queue,
+                MessageBody="test",
+                MessageAttributes={"ErrorDetails": {"StringValue": "", "DataType": "String"}},
+            )
+
+        assert e.value.response["Error"] == {
+            "Type": "Sender",
+            "Code": "InvalidParameterValue",
+            "Message": "Message (user) attribute 'ErrorDetails' must contain a non-empty value of type 'String'.",
+        }
+
+    @pytest.mark.aws_validated
     def test_send_message_with_invalid_string_attributes(self, sqs_client, sqs_create_queue):
         queue_name = f"queue-{short_uid()}"
         queue_url = sqs_create_queue(QueueName=queue_name)
@@ -1072,6 +1162,50 @@ class TestSqsProvider:
         )
         result_recv = sqs_client.receive_message(QueueUrl=dl_queue_url, VisibilityTimeout=0)
         assert result_recv["Messages"][0]["Body"] == json.dumps(payload)
+
+    @pytest.mark.aws_validated
+    def test_dead_letter_queue_with_fifo_and_content_based_deduplication(
+        self, sqs_client, sqs_create_queue
+    ):
+        dlq_url = sqs_create_queue(
+            QueueName=f"test-dlq-{short_uid()}.fifo",
+            Attributes={
+                "FifoQueue": "true",
+                "ContentBasedDeduplication": "true",
+                "MessageRetentionPeriod": "1209600",
+            },
+        )
+        dlq_arn = get_queue_arn(sqs_client, dlq_url)
+
+        queue_url = sqs_create_queue(
+            QueueName=f"test-queue-{short_uid()}.fifo",
+            Attributes={
+                "FifoQueue": "true",
+                "ContentBasedDeduplication": "true",
+                "VisibilityTimeout": "60",
+                "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": 2}),
+            },
+        )
+
+        response = sqs_client.send_message(
+            QueueUrl=queue_url, MessageBody="foobar", MessageGroupId="1"
+        )
+        message_id = response["MessageId"]
+
+        # receive the messages twice, which is the maximum allwed
+        sqs_client.receive_message(QueueUrl=queue_url, WaitTimeSeconds=1, VisibilityTimeout=0)
+        sqs_client.receive_message(QueueUrl=queue_url, WaitTimeSeconds=1, VisibilityTimeout=0)
+        # after this receive call the message should be in the DLQ
+        sqs_client.receive_message(QueueUrl=queue_url, WaitTimeSeconds=1, VisibilityTimeout=0)
+
+        # check the DLQ
+        response = sqs_client.receive_message(QueueUrl=dlq_url, WaitTimeSeconds=10)
+        assert (
+            len(response["Messages"]) == 1
+        ), f"invalid number of messages in DLQ response {response}"
+        message = response["Messages"][0]
+        assert message["MessageId"] == message_id
+        assert message["Body"] == "foobar"
 
     def test_dead_letter_queue_max_receive_count(self, sqs_client, sqs_create_queue):
         queue_name = f"queue-{short_uid()}"
@@ -1297,7 +1431,11 @@ class TestSqsProvider:
             "X-Amz-Signature": signer.signature(string_to_sign, req),
         }
 
-        response = requests.post(url=base_url, data=urlencode(payload))
+        response = requests.post(
+            url=base_url,
+            data=urlencode(payload),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         assert response.status_code == 200
         assert b"<ListQueuesResponse" in response.content
 
@@ -1319,8 +1457,7 @@ class TestSqsProvider:
 
     @pytest.mark.aws_validated
     def test_system_attributes_have_no_effect_on_attr_md5(self, sqs_create_queue, sqs_client):
-        queue_name = f"queue-{short_uid()}"
-        queue_url = sqs_create_queue(QueueName=queue_name)
+        queue_url = sqs_create_queue()
 
         msg_attrs_provider = {"timestamp": {"StringValue": "1493147359900", "DataType": "Number"}}
         aws_trace_header = {
@@ -1726,6 +1863,154 @@ class TestSqsProvider:
             assert k in keys
             assert attributes[k] == result_attributes[k]
 
+    def test_receive_message_message_attribute_names_filters(
+        self, sqs_client, sqs_create_queue, snapshot
+    ):
+        """
+        Receive message allows a list of filters to be passed with MessageAttributeNames. See:
+        https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sqs.html#SQS.Client.receive_message
+        """
+        snapshot.skip_key(re.compile(r"^ReceiptHandle$"), "")
+
+        queue_url = sqs_create_queue(Attributes={"VisibilityTimeout": "0"})
+
+        response = sqs_client.send_message(
+            QueueUrl=queue_url,
+            MessageBody="msg",
+            MessageAttributes={
+                "Help.Me": {"DataType": "String", "StringValue": "Me"},
+                "Hello": {"DataType": "String", "StringValue": "There"},
+                "General": {"DataType": "String", "StringValue": "Kenobi"},
+            },
+        )
+        assert snapshot.match("send_message_response", response)
+
+        def receive_message(message_attribute_names):
+            return sqs_client.receive_message(
+                QueueUrl=queue_url,
+                WaitTimeSeconds=5,
+                MessageAttributeNames=message_attribute_names,
+            )
+
+        # test empty filter
+        response = receive_message([])
+        # do the first check with the entire response
+        assert snapshot.match("empty_filter", response)
+
+        # test "All"
+        response = receive_message(["All"])
+        assert snapshot.match("all_name", response)
+
+        # test ".*"
+        response = receive_message([".*"])
+        assert snapshot.match("all_wildcard", response["Messages"][0])
+
+        # test only non-existent names
+        response = receive_message(["Foo", "Help"])
+        assert snapshot.match("only_non_existing_names", response["Messages"][0])
+
+        # test all existing
+        response = receive_message(["Hello", "General"])
+        assert snapshot.match("only_existing", response["Messages"][0])
+
+        # test existing and non-existing
+        response = receive_message(["Foo", "Hello"])
+        assert snapshot.match("existing_and_non_existing", response["Messages"][0])
+
+        # test prefix filters
+        response = receive_message(["Hel.*"])
+        assert snapshot.match("prefix_filter", response["Messages"][0])
+
+        # test illegal names
+        response = receive_message(["AWS."])
+        assert snapshot.match("illegal_name_1", response)
+        response = receive_message(["..foo"])
+        assert snapshot.match("illegal_name_2", response)
+
+    def test_receive_message_attribute_names_filters(self, sqs_client, sqs_create_queue, snapshot):
+        snapshot.skip_key(re.compile(r"^ReceiptHandle$"), "")
+        snapshot.skip_key(re.compile(r"^SenderId$"), "")
+
+        queue_url = sqs_create_queue(Attributes={"VisibilityTimeout": "0"})
+
+        sqs_client.send_message(
+            QueueUrl=queue_url,
+            MessageBody="msg",
+            MessageAttributes={
+                "Foo": {"DataType": "String", "StringValue": "Bar"},
+            },
+        )
+
+        def receive_message(attribute_names, message_attribute_names=None):
+            return sqs_client.receive_message(
+                QueueUrl=queue_url,
+                WaitTimeSeconds=5,
+                AttributeNames=attribute_names,
+                MessageAttributeNames=message_attribute_names or [],
+            )
+
+        response = receive_message(["All"])
+        assert snapshot.match("all_attributes", response)
+
+        response = receive_message(["All"], ["All"])
+        assert snapshot.match("all_system_and_message_attributes", response)
+
+        response = receive_message(["SenderId"])
+        assert snapshot.match("single_attribute", response)
+
+        response = receive_message(["SenderId", "SequenceNumber"])
+        assert snapshot.match("multiple_attributes", response)
+
+    @pytest.mark.aws_validated
+    def test_change_visibility_on_deleted_message_raises_invalid_parameter_value(
+        self, sqs_client, sqs_queue
+    ):
+        # prepare the fixture
+        sqs_client.send_message(QueueUrl=sqs_queue, MessageBody="foo")
+        response = sqs_client.receive_message(QueueUrl=sqs_queue, WaitTimeSeconds=5)
+        handle = response["Messages"][0]["ReceiptHandle"]
+
+        # check that it works as expected
+        sqs_client.change_message_visibility(
+            QueueUrl=sqs_queue, ReceiptHandle=handle, VisibilityTimeout=42
+        )
+
+        # delete the message, the handle becomes invalid
+        sqs_client.delete_message(QueueUrl=sqs_queue, ReceiptHandle=handle)
+
+        with pytest.raises(ClientError) as e:
+            sqs_client.change_message_visibility(
+                QueueUrl=sqs_queue, ReceiptHandle=handle, VisibilityTimeout=42
+            )
+
+        err = e.value.response["Error"]
+        assert err["Code"] == "InvalidParameterValue"
+        assert (
+            err["Message"]
+            == f"Value {handle} for parameter ReceiptHandle is invalid. Reason: Message does not exist or is not "
+            f"available for visibility timeout change."
+        )
+
+    @pytest.mark.aws_validated
+    def test_delete_message_with_illegal_receipt_handle(self, sqs_client, sqs_queue):
+        with pytest.raises(ClientError) as e:
+            sqs_client.delete_message(QueueUrl=sqs_queue, ReceiptHandle="garbage")
+
+        err = e.value.response["Error"]
+        assert err["Code"] == "ReceiptHandleIsInvalid"
+        assert err["Message"] == 'The input receipt handle "garbage" is not a valid receipt handle.'
+
+    @pytest.mark.aws_validated
+    def test_delete_message_with_deleted_receipt_handle(self, sqs_client, sqs_queue):
+        sqs_client.send_message(QueueUrl=sqs_queue, MessageBody="foo")
+        response = sqs_client.receive_message(QueueUrl=sqs_queue, WaitTimeSeconds=5)
+        handle = response["Messages"][0]["ReceiptHandle"]
+
+        # does not raise errors even after successive calls
+        sqs_client.delete_message(QueueUrl=sqs_queue, ReceiptHandle=handle)
+        sqs_client.delete_message(QueueUrl=sqs_queue, ReceiptHandle=handle)
+        sqs_client.delete_message(QueueUrl=sqs_queue, ReceiptHandle=handle)
+
 
 def get_region():
     return os.environ.get("AWS_DEFAULT_REGION") or TEST_REGION
@@ -1819,6 +2104,44 @@ class TestSqsQueryApi:
         assert "<Attribute><Name>QueueArn</Name><Value>arn:aws:sqs:" in response.text
         assert "<Attribute><Name>VisibilityTimeout</Name>" not in response.text
         assert queue_url.split("/")[-1] in response.text
+
+    @pytest.mark.aws_validated
+    def test_invalid_action_raises_exception(self, sqs_create_queue, sqs_http_client):
+        queue_url = sqs_create_queue()
+        response = sqs_http_client.get(
+            queue_url,
+            params={
+                "Action": "FooBar",
+                "Version": "2012-11-05",
+            },
+        )
+
+        assert not response.ok
+        assert "<Code>InvalidAction</Code>" in response.text
+        assert "<Type>Sender</Type>" in response.text
+        assert (
+            "<Message>The action FooBar is not valid for this endpoint.</Message>" in response.text
+        )
+
+    @pytest.mark.aws_validated
+    def test_valid_action_with_missing_parameter_raises_exception(
+        self, sqs_create_queue, sqs_http_client
+    ):
+        queue_url = sqs_create_queue()
+        response = sqs_http_client.get(
+            queue_url,
+            params={
+                "Action": "SendMessage",
+            },
+        )
+
+        assert not response.ok
+        assert "<Code>MissingParameter</Code>" in response.text
+        assert "<Type>Sender</Type>" in response.text
+        assert (
+            "<Message>The request must contain the parameter MessageBody.</Message>"
+            in response.text
+        )
 
     @pytest.mark.aws_validated
     def test_get_queue_attributes_of_fifo_queue(self, sqs_create_queue, sqs_http_client):

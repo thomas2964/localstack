@@ -85,18 +85,9 @@ FIFO_MSG_REGEX = "^[0-9a-zA-z!\"#$%&'()*+,./:;<=>?@[\\]^_`{|}~-]*$"
 DEDUPLICATION_INTERVAL_IN_SEC = 5 * 60
 
 
-def generate_message_id():
-    return long_uid()
-
-
-def generate_receipt_handle():
-    # http://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/ImportantIdentifiers.html#ImportantIdentifiers-receipt-handles
-    return "".join(random.choices(string.ascii_letters + string.digits, k=172)) + "="
-
-
 class InvalidParameterValue(CommonServiceException):
     def __init__(self, message):
-        super().__init__("InvalidParameterValues", message, 400, True)
+        super().__init__("InvalidParameterValue", message, 400, True)
 
 
 class InvalidAttributeValue(CommonServiceException):
@@ -107,6 +98,10 @@ class InvalidAttributeValue(CommonServiceException):
 class MissingParameter(CommonServiceException):
     def __init__(self, message):
         super().__init__("MissingParameter", message, 400, True)
+
+
+def generate_message_id():
+    return long_uid()
 
 
 def assert_queue_name(queue_name: str, fifo: bool = False):
@@ -131,6 +126,27 @@ def check_message_content(message_body: str):
 
     if not re.match(MSG_CONTENT_REGEX, message_body):
         raise InvalidMessageContents(error)
+
+
+def encode_receipt_handle(queue_arn, message: "SqsMessage") -> str:
+    # http://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/ImportantIdentifiers.html#ImportantIdentifiers-receipt-handles
+    # encode the queue arn in the receipt handle, so we can later check if it belongs to the queue
+    # but also add some randomness s.t. the generated receipt handles look like the ones from AWS
+    handle = f"{long_uid()} {queue_arn} {message.message.get('MessageId')} {message.last_received}"
+    encoded = base64.b64encode(handle.encode("utf-8"))
+    return encoded.decode("utf-8")
+
+
+def decode_receipt_handle(receipt_handle: str) -> str:
+    try:
+        handle = base64.b64decode(receipt_handle).decode("utf-8")
+        _, queue_arn, message_id, last_received = handle.split(" ")
+        parse_arn(queue_arn)  # raises a ValueError if it is not an arn
+        return queue_arn
+    except (IndexError, ValueError):
+        raise ReceiptHandleIsInvalid(
+            f'The input receipt handle "{receipt_handle}" is not a valid receipt handle.'
+        )
 
 
 class Permission(NamedTuple):
@@ -302,12 +318,26 @@ class SqsQueue:
     def visibility_timeout(self) -> int:
         return int(self.attributes[QueueAttributeName.VisibilityTimeout])
 
+    @property
+    def wait_time_seconds(self) -> int:
+        return int(self.attributes[QueueAttributeName.ReceiveMessageWaitTimeSeconds])
+
+    def validate_receipt_handle(self, receipt_handle: str):
+        if self.arn != decode_receipt_handle(receipt_handle):
+            raise ReceiptHandleIsInvalid(
+                f'The input receipt handle "{receipt_handle}" is not a valid receipt handle.'
+            )
+
     def update_visibility_timeout(self, receipt_handle: str, visibility_timeout: int):
         with self.mutex:
+            self.validate_receipt_handle(receipt_handle)
+
             if receipt_handle not in self.receipts:
-                raise ReceiptHandleIsInvalid(
-                    f'The input receipt handle "{receipt_handle}" is not a valid receipt handle.'
+                raise InvalidParameterValue(
+                    f"Value {receipt_handle} for parameter ReceiptHandle is invalid. Reason: Message does not exist "
+                    f"or is not available for visibility timeout change."
                 )
+
             standard_message = self.receipts[receipt_handle]
 
             if standard_message not in self.inflight:
@@ -327,6 +357,8 @@ class SqsQueue:
 
     def remove(self, receipt_handle: str):
         with self.mutex:
+            self.validate_receipt_handle(receipt_handle)
+
             if receipt_handle not in self.receipts:
                 LOG.debug(
                     "no in-flight message found for receipt handle %s in queue %s",
@@ -394,7 +426,7 @@ class SqsQueue:
                     standard_message.first_received = standard_message.last_received
 
                 # create and manage receipt handle
-                receipt_handle = generate_receipt_handle()
+                receipt_handle = self.create_receipt_handle(standard_message)
                 standard_message.receipt_handles.add(receipt_handle)
                 self.receipts[receipt_handle] = standard_message
 
@@ -403,12 +435,20 @@ class SqsQueue:
                 else:
                     self.inflight.add(standard_message)
 
-                # prepare message for receiver
-                # TODO: update message attributes (ApproximateFirstReceiveTimestamp, ApproximateReceiveCount)
-                copied_message = copy.deepcopy(standard_message)
-                copied_message.message["ReceiptHandle"] = receipt_handle
+            # prepare message for receiver
+            copied_message = copy.deepcopy(standard_message)
+            copied_message.message["Attributes"][
+                MessageSystemAttributeName.ApproximateReceiveCount
+            ] = str(standard_message.receive_times)
+            copied_message.message["Attributes"][
+                MessageSystemAttributeName.ApproximateFirstReceiveTimestamp
+            ] = standard_message.first_received
+            copied_message.message["ReceiptHandle"] = receipt_handle
 
             return copied_message
+
+    def create_receipt_handle(self, message: SqsMessage) -> str:
+        return encode_receipt_handle(self.arn, message)
 
     def requeue_inflight_messages(self):
         if not self.inflight:
@@ -638,6 +678,12 @@ def check_attributes(message_attributes: MessageBodyAttributeMap):
         if attribute_type == "String":
             try:
                 attribute_value = attribute.get("StringValue")
+
+                if not attribute_value:
+                    raise InvalidParameterValue(
+                        f"Message (user) attribute '{attribute_name}' must contain a non-empty value of type 'String'."
+                    )
+
                 check_message_content(attribute_value)
             except InvalidMessageContents as e:
                 # AWS throws a different exception here
@@ -972,8 +1018,6 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         message_deduplication_id: String = None,
         message_group_id: String = None,
     ) -> Message:
-        # TODO: default message attributes (SenderId, ApproximateFirstReceiveTimestamp, ...)
-
         check_message_content(message_body)
         check_attributes(message_attributes)
         check_attributes(message_system_attributes)
@@ -1021,10 +1065,18 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
     ) -> ReceiveMessageResult:
         queue = self._resolve_queue(context, queue_url=queue_url)
 
+        if wait_time_seconds is None:
+            wait_time_seconds = queue.wait_time_seconds
+
         num = max_number_of_messages or 1
-        block = wait_time_seconds is not None
+        block = True if wait_time_seconds else False
         # collect messages
         messages = []
+
+        # we chose to always return the maximum possible number of messages, even though AWS will typically return
+        # fewer messages than requested on small queues. at some point we could maybe change this to randomly sample
+        # between 1 and max_number_of_messages.
+        # see https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html
         while num:
             try:
                 standard_message = queue.get(
@@ -1034,6 +1086,11 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
             except Empty:
                 break
 
+            # setting block to false guarantees that, if we've already waited before, we don't wait the full time
+            # again in the next iteration if max_number_of_messages is set but there are no more messages in the
+            # queue. see https://github.com/localstack/localstack/issues/5824
+            block = False
+
             moved_to_dlq = False
             if (
                 queue.attributes
@@ -1042,20 +1099,18 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
                 moved_to_dlq = self._dead_letter_check(queue, standard_message, context)
             if moved_to_dlq:
                 continue
-            # filter attributes
-            if message_attribute_names:
-                if "All" not in message_attribute_names:
-                    msg["MessageAttributes"] = {
-                        k: v
-                        for k, v in msg["MessageAttributes"].items()
-                        if k in message_attribute_names
-                    }
-                # TODO: why is this called even if we receive "All" attributes?
+
+            msg = copy.deepcopy(msg)
+            message_filter_attributes(msg, attribute_names)
+            message_filter_message_attributes(msg, message_attribute_names)
+
+            if msg.get("MessageAttributes"):
                 msg["MD5OfMessageAttributes"] = _create_message_attribute_hash(
                     msg["MessageAttributes"]
                 )
             else:
-                del msg["MessageAttributes"]
+                # delete the value that was computed when creating the message
+                msg.pop("MD5OfMessageAttributes")
 
             # add message to result
             messages.append(msg)
@@ -1075,7 +1130,11 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
             dl_queue = self._require_queue_by_arn(context, dead_letter_target_arn)
             # TODO: this needs to be atomic?
             dead_message = std_m.message
-            dl_queue.put(message=dead_message)
+            dl_queue.put(
+                message=dead_message,
+                message_deduplication_id=std_m.message_deduplication_id,
+                message_group_id=std_m.message_group_id,
+            )
             queue.remove(std_m.message["ReceiptHandle"])
             return True
         else:
@@ -1174,7 +1233,8 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
                 valid_count = False
             if not valid_count:
                 raise InvalidParameterValue(
-                    f"Value {redrive_policy} for parameter RedrivePolicy is invalid. Reason: Invalid value for maxReceiveCount: {max_receive_count}, valid values are from 1 to 1000 both inclusive."
+                    f"Value {redrive_policy} for parameter RedrivePolicy is invalid. Reason: Invalid value for "
+                    f"maxReceiveCount: {max_receive_count}, valid values are from 1 to 1000 both inclusive. "
                 )
 
     def tag_queue(self, context: RequestContext, queue_url: String, tags: TagMap) -> None:
@@ -1226,7 +1286,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         message_system_attributes: MessageBodySystemAttributeMap = None,
     ) -> Dict[MessageSystemAttributeName, str]:
         result: Dict[MessageSystemAttributeName, str] = {
-            MessageSystemAttributeName.SenderId: context.account_id,
+            MessageSystemAttributeName.SenderId: context.account_id,  # not the account ID in AWS
             MessageSystemAttributeName.SentTimestamp: str(now()),
         }
 
@@ -1323,3 +1383,66 @@ def resolve_queue_name(
             queue_name = get_queue_name_from_url(context.request.base_url)
 
     return queue_name
+
+
+def message_filter_attributes(message: Message, names: Optional[AttributeNameList]):
+    """
+    Utility function filter from the given message (in-place) the system attributes from the given list. It will
+    apply all rules according to:
+    https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sqs.html#SQS.Client.receive_message.
+
+    :param message: The message to filter (it will be modified)
+    :param names: the attributes names/filters
+    """
+    if "Attributes" not in message:
+        return
+
+    if not names:
+        del message["Attributes"]
+        return
+
+    if "All" in names:
+        return
+
+    for k in list(message["Attributes"].keys()):
+        if k not in names:
+            del message["Attributes"][k]
+
+
+def message_filter_message_attributes(message: Message, names: Optional[MessageAttributeNameList]):
+    """
+    Utility function filter from the given message (in-place) the message attributes from the given list. It will
+    apply all rules according to:
+    https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sqs.html#SQS.Client.receive_message.
+
+    :param message: The message to filter (it will be modified)
+    :param names: the attributes names/filters (can be 'All', '.*', or prefix filters like 'Foo.*')
+    """
+    if not message.get("MessageAttributes"):
+        return
+
+    if not names:
+        del message["MessageAttributes"]
+        return
+
+    if "All" in names or ".*" in names:
+        return
+
+    attributes = message["MessageAttributes"]
+    matched = []
+
+    keys = [name for name in names if ".*" not in name]
+    prefixes = [name.split(".*")[0] for name in names if ".*" in name]
+
+    # match prefix filters
+    for k in attributes:
+        if k in keys:
+            matched.append(k)
+            continue
+
+        for prefix in prefixes:
+            if k.startswith(prefix):
+                matched.append(k)
+            break
+
+    message["MessageAttributes"] = {k: attributes[k] for k in matched}

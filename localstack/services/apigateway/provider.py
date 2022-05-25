@@ -568,7 +568,7 @@ class ApigatewayProvider(ApigatewayApi, ServiceLifecycleHook):
             "name": name,
             "restApiId": rest_api_id,
             "validateRequestBody": validate_request_body,
-            "validateRequestPparameters": validate_request_parameters,
+            "validateRequestParameters": validate_request_parameters,
         }
         region_details.validators.setdefault(rest_api_id, []).append(entry)
 
@@ -666,6 +666,14 @@ class ApigatewayProvider(ApigatewayApi, ServiceLifecycleHook):
                 body=body,
             ),
         )
+
+    def delete_integration(
+        self, context: RequestContext, rest_api_id: String, resource_id: String, http_method: String
+    ) -> None:
+        try:
+            call_moto(context)
+        except Exception as e:
+            raise NotFoundException("Invalid Resource identifier specified") from e
 
 
 # ---------------

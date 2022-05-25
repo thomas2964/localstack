@@ -885,7 +885,7 @@ def mock_aws_request_headers(
     ctype = APPLICATION_AMZ_JSON_1_0
     if service == "kinesis":
         ctype = APPLICATION_AMZ_JSON_1_1
-    elif service in ["sns", "sqs"]:
+    elif service in ["sns", "sqs", "sts", "cloudformation"]:
         ctype = APPLICATION_X_WWW_FORM_URLENCODED
 
     access_key = access_key or get_account_id()

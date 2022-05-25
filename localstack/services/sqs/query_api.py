@@ -8,14 +8,17 @@ from urllib.parse import urlencode
 
 from botocore.exceptions import ClientError
 from botocore.model import OperationModel
+from werkzeug.datastructures import Headers
 
 from localstack import config
 from localstack.aws.api import CommonServiceException
 from localstack.aws.protocol.parser import OperationNotFoundParserError, create_parser
 from localstack.aws.protocol.serializer import create_serializer
+from localstack.aws.protocol.validate import MissingRequiredField, validate_request
 from localstack.aws.spec import load_service
 from localstack.http import Request, Response, Router, route
 from localstack.http.dispatcher import Handler
+from localstack.services.sqs.provider import MissingParameter
 from localstack.utils.aws import aws_stack
 
 LOG = logging.getLogger(__name__)
@@ -99,6 +102,7 @@ def handle_request(request: Request, region: str) -> Response:
 
     try:
         response, operation = try_call_sqs(request, region)
+        del response["ResponseMetadata"]
         return serializer.serialize_to_response(response, operation)
     except UnknownOperationException:
         return Response("<UnknownOperationException/>", 404)
@@ -133,11 +137,14 @@ def try_call_sqs(request: Request, region: str) -> Tuple[Dict, OperationModel]:
     body = urlencode(params)
 
     try:
-        operation, service_request = parser.parse(
-            Request("POST", "/", headers=request.headers, body=body)
-        )
+        headers = Headers(request.headers)
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+        operation, service_request = parser.parse(Request("POST", "/", headers=headers, body=body))
+        validate_request(operation, service_request).raise_first()
     except OperationNotFoundParserError:
         raise InvalidAction(action)
+    except MissingRequiredField as e:
+        raise MissingParameter(f"The request must contain the parameter {e.required_name}.")
 
     # TODO: permissions encoded in URL as AUTHPARAMS cannot be accounted for in this method, which is not a big
     #  problem yet since we generally don't enforce permissions.
